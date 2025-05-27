@@ -43,6 +43,12 @@ public class Projectile : MonoBehaviour
     public AudioClip explosionSound;
     public float explosionDelay = 0f;
 
+    [Header("Explosion Force Settings")]
+    public float explosionForce = 500f;
+    public float explosionRadius = 5f;
+    public float upwardsModifier = 1f;
+    public LayerMask affectedLayers = -1; // All layers by default
+
     private AudioSource audioSource;
 
     void Start()
@@ -56,24 +62,67 @@ public class Projectile : MonoBehaviour
 
     void OnCollisionEnter(Collision collision)
     {
-        Explode();
+        Explode(collision.contacts[0].point);
     }
 
-    void Explode()
+    void Explode(Vector3 explosionPoint)
     {
+        // Apply explosion force to nearby rigidbodies
+        ApplyExplosionForce(explosionPoint);
+
         // Spawn explosion particles
         if (explosionParticlesPrefab != null)
         {
-            Instantiate(explosionParticlesPrefab, transform.position, Quaternion.identity);
+            GameObject particles = Instantiate(explosionParticlesPrefab, explosionPoint, Quaternion.identity);
+
+            // Auto-destroy particles after their duration (optional)
+            ParticleSystem ps = particles.GetComponent<ParticleSystem>();
+            if (ps != null)
+            {
+                Destroy(particles, ps.main.duration + ps.main.startLifetime.constantMax);
+            }
+            else
+            {
+                Destroy(particles, 5f); // Fallback destroy time
+            }
         }
 
         // Play explosion sound
         if (explosionSound != null)
         {
-            AudioSource.PlayClipAtPoint(explosionSound, transform.position);
+            AudioSource.PlayClipAtPoint(explosionSound, explosionPoint);
         }
 
         // Destroy projectile
         Destroy(gameObject);
+    }
+
+    void ApplyExplosionForce(Vector3 explosionPoint)
+    {
+        // Find all colliders within explosion radius
+        Collider[] colliders = Physics.OverlapSphere(explosionPoint, explosionRadius, affectedLayers);
+
+        foreach (Collider col in colliders)
+        {
+            // Skip the projectile itself
+            if (col.gameObject == gameObject) continue;
+
+            Rigidbody rb = col.GetComponent<Rigidbody>();
+            if (rb != null)
+            {
+                // Apply explosion force
+                rb.AddExplosionForce(explosionForce, explosionPoint, explosionRadius, upwardsModifier, ForceMode.Impulse);
+            }
+
+            // Optional: Apply force to other objects (like particle systems, etc.)
+            // You can add custom behavior here for non-rigidbody objects
+        }
+    }
+
+    // Optional: Visualize explosion radius in Scene view
+    void OnDrawGizmosSelected()
+    {
+        Gizmos.color = Color.red;
+        Gizmos.DrawWireSphere(transform.position, explosionRadius);
     }
 }
