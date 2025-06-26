@@ -25,11 +25,22 @@ public class EnemyFighter : MonoBehaviour
     public float attackDistance = 50f;
     public float avoidDistance = 15f;
 
+    [Header("Collision Avoidance")]
+    public float minGroundHeight = 15f;
+    public float groundAvoidForce = 20f;
+    public float obstacleAvoidDistance = 30f;
+    public float obstacleAvoidForce = 15f;
+    public float avoidanceViewAngle = 60f;
+    public LayerMask groundLayer = 1; // Default layer
+    public LayerMask obstacleLayer = -1; // All layers
+
     [Header("Combat")]
     public Transform gunPoint;
     public GameObject bulletPrefab;
     public float fireRate = 0.3f;
     public float bulletSpeed = 80f;
+    public float aimTolerance = 0.8f; // How accurate aim needs to be (0.8 = ~36 degree cone)
+    public float leadTargetAccuracy = 1.2f; // Multiplier for prediction accuracy
 
     private Rigidbody rb;
     private float lastFireTime;
@@ -62,6 +73,7 @@ public class EnemyFighter : MonoBehaviour
     void FixedUpdate()
     {
         ApplyFlight();
+        ApplyCollisionAvoidance();
     }
 
     void UpdateAI()
@@ -132,7 +144,9 @@ public class EnemyFighter : MonoBehaviour
             case AIState.Attack:
                 targetPos = PredictTargetPosition();
                 TryFire();
-                break;
+                // Also aim the aircraft towards the predicted position for better shots
+                FlyTowards(targetPos);
+                return; // Skip the general FlyTowards call
 
             case AIState.Evade:
                 targetPos = transform.position + (transform.position - target.position).normalized * 50f;
@@ -149,8 +163,18 @@ public class EnemyFighter : MonoBehaviour
         Rigidbody targetRb = target.GetComponent<Rigidbody>();
         if (targetRb != null)
         {
-            float timeToTarget = Vector3.Distance(transform.position, target.position) / bulletSpeed;
-            return target.position + targetRb.linearVelocity * timeToTarget;
+            // Calculate time for bullet to reach target
+            float distanceToTarget = Vector3.Distance(transform.position, target.position);
+            float timeToTarget = distanceToTarget / bulletSpeed;
+
+            // Predict where target will be, with accuracy multiplier
+            Vector3 predictedPos = target.position + (targetRb.linearVelocity * timeToTarget * leadTargetAccuracy);
+
+            // Add some vertical lead if target is climbing/diving
+            Vector3 verticalVelocity = Vector3.Project(targetRb.linearVelocity, Vector3.up);
+            predictedPos += verticalVelocity * timeToTarget * 0.5f;
+
+            return predictedPos;
         }
 
         return target.position;
@@ -222,30 +246,126 @@ public class EnemyFighter : MonoBehaviour
         rb.AddTorque(pitchDampingTorque);
     }
 
+    void ApplyCollisionAvoidance()
+    {
+        // Ground avoidance
+        AvoidGround();
+
+        // Obstacle avoidance
+        AvoidObstacles();
+    }
+
+    void AvoidGround()
+    {
+        // Raycast straight down to check ground distance
+        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit hit, minGroundHeight * 2f, groundLayer))
+        {
+            float distanceToGround = hit.distance;
+
+            if (distanceToGround < minGroundHeight)
+            {
+                // Calculate avoidance force - stronger when closer to ground
+                float avoidanceStrength = (minGroundHeight - distanceToGround) / minGroundHeight;
+                Vector3 upwardForce = Vector3.up * avoidanceStrength * groundAvoidForce;
+                rb.AddForce(upwardForce, ForceMode.Acceleration);
+
+                // Also apply pitch up torque for more aggressive climb
+                Vector3 pitchUpTorque = transform.right * avoidanceStrength * groundAvoidForce * 0.5f;
+                rb.AddTorque(pitchUpTorque);
+            }
+        }
+    }
+
+    void AvoidObstacles()
+    {
+        Vector3 forwardDir = transform.forward;
+        Vector3 rightDir = transform.right;
+        Vector3 upDir = transform.up;
+
+        // Create a cone of rays to detect obstacles
+        Vector3[] rayDirections = {
+            forwardDir,
+            Quaternion.AngleAxis(avoidanceViewAngle * 0.5f, upDir) * forwardDir,
+            Quaternion.AngleAxis(-avoidanceViewAngle * 0.5f, upDir) * forwardDir,
+            Quaternion.AngleAxis(avoidanceViewAngle * 0.5f, rightDir) * forwardDir,
+            Quaternion.AngleAxis(-avoidanceViewAngle * 0.5f, rightDir) * forwardDir,
+        };
+
+        Vector3 totalAvoidanceForce = Vector3.zero;
+
+        foreach (Vector3 rayDir in rayDirections)
+        {
+            if (Physics.Raycast(transform.position, rayDir, out RaycastHit hit, obstacleAvoidDistance, obstacleLayer))
+            {
+                // Skip if it's the ground (handled separately)
+                if (hit.collider.CompareTag("Ground")) continue;
+
+                // Calculate avoidance direction (perpendicular to the obstacle)
+                Vector3 avoidDirection = Vector3.Cross(hit.normal, Vector3.up);
+                if (Vector3.Dot(avoidDirection, rightDir) < 0)
+                    avoidDirection = -avoidDirection;
+
+                // Add upward component to avoid flying into obstacles
+                avoidDirection += Vector3.up * 0.5f;
+                avoidDirection.Normalize();
+
+                // Calculate force strength based on distance
+                float distanceRatio = 1f - (hit.distance / obstacleAvoidDistance);
+                Vector3 avoidForce = avoidDirection * distanceRatio * obstacleAvoidForce;
+
+                totalAvoidanceForce += avoidForce;
+            }
+        }
+
+        // Apply the combined avoidance force
+        if (totalAvoidanceForce.magnitude > 0.1f)
+        {
+            rb.AddForce(totalAvoidanceForce, ForceMode.Acceleration);
+
+            // Convert avoidance force to rotational input for more natural steering
+            Vector3 localAvoidance = transform.InverseTransformDirection(totalAvoidanceForce.normalized);
+
+            // Apply steering torque based on avoidance direction
+            float steerYaw = localAvoidance.x * obstacleAvoidForce * 0.3f;
+            float steerPitch = localAvoidance.y * obstacleAvoidForce * 0.2f;
+
+            rb.AddTorque(transform.up * steerYaw);
+            rb.AddTorque(transform.right * steerPitch);
+        }
+    }
+
     void TryFire()
     {
         if (Time.time - lastFireTime < fireRate || gunPoint == null || bulletPrefab == null)
             return;
 
-        // Check if target is roughly in front
-        Vector3 toTarget = (target.position - transform.position).normalized;
-        float dot = Vector3.Dot(transform.forward, toTarget);
+        // Get predicted target position
+        Vector3 predictedTargetPos = PredictTargetPosition();
+        Vector3 toTarget = (predictedTargetPos - gunPoint.position).normalized;
 
-        if (dot > 0.7f) // ~45 degree cone
+        // Check if predicted target is in firing cone
+        float dot = Vector3.Dot(gunPoint.forward, toTarget);
+
+        if (dot > aimTolerance)
         {
-            FireBullet();
+            FireBullet(predictedTargetPos);
             lastFireTime = Time.time;
         }
     }
 
-    void FireBullet()
+    void FireBullet(Vector3 targetPosition)
     {
         GameObject bullet = Instantiate(bulletPrefab, gunPoint.position, gunPoint.rotation);
         Rigidbody bulletRb = bullet.GetComponent<Rigidbody>();
 
         if (bulletRb != null)
         {
-            bulletRb.linearVelocity = gunPoint.forward * bulletSpeed + rb.linearVelocity;
+            // Calculate firing direction towards predicted position
+            Vector3 fireDirection = (targetPosition - gunPoint.position).normalized;
+
+            // Add our own velocity to the bullet (realistic physics)
+            Vector3 bulletVelocity = fireDirection * bulletSpeed + rb.linearVelocity * 0.3f;
+            bulletRb.linearVelocity = bulletVelocity;
         }
     }
 
@@ -276,11 +396,43 @@ public class EnemyFighter : MonoBehaviour
             Gizmos.DrawLine(transform.position, target.position);
         }
 
-        // Draw firing direction
+        // Draw firing direction and predicted target
         if (gunPoint != null)
         {
             Gizmos.color = Color.cyan;
             Gizmos.DrawRay(gunPoint.position, gunPoint.forward * 20f);
+
+            // Draw predicted target position when in attack mode
+            if (currentState == AIState.Attack && target != null)
+            {
+                Vector3 predictedPos = PredictTargetPosition();
+                Gizmos.color = Color.red;
+                Gizmos.DrawWireSphere(predictedPos, 2f);
+                Gizmos.DrawLine(gunPoint.position, predictedPos);
+            }
+        }
+
+        // Draw collision avoidance rays
+        Gizmos.color = Color.magenta;
+        Vector3 forwardDir = transform.forward;
+        Vector3 rightDir = transform.right;
+        Vector3 upDir = transform.up;
+
+        // Ground check ray
+        Gizmos.DrawRay(transform.position, Vector3.down * minGroundHeight * 2f);
+
+        // Obstacle avoidance rays
+        Vector3[] rayDirections = {
+            forwardDir,
+            Quaternion.AngleAxis(avoidanceViewAngle * 0.5f, upDir) * forwardDir,
+            Quaternion.AngleAxis(-avoidanceViewAngle * 0.5f, upDir) * forwardDir,
+            Quaternion.AngleAxis(avoidanceViewAngle * 0.5f, rightDir) * forwardDir,
+            Quaternion.AngleAxis(-avoidanceViewAngle * 0.5f, rightDir) * forwardDir,
+        };
+
+        foreach (Vector3 rayDir in rayDirections)
+        {
+            Gizmos.DrawRay(transform.position, rayDir * obstacleAvoidDistance);
         }
     }
 }
